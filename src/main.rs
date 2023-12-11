@@ -1,5 +1,6 @@
 #[macro_use]
 extern crate lazy_static;
+extern crate tracing;
 
 use std::sync::Arc;
 
@@ -11,19 +12,22 @@ use zenoh::prelude::sync::*;
 mod cli;
 mod tasks;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+use tracing::*;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct MAVLinkMessage<T> {
     pub header: mavlink::MavHeader,
     pub message: T,
 }
 
 fn main() {
+    env_logger::init();
     let mut task_master = tasks::TaskMaster::new();
     let args = &cli::App;
     let vehicle = Arc::new(mavlink::connect::<MavMessage>(&args.connect).unwrap());
     let heartbeat_vehicle = vehicle.clone();
     let sender_vehicle = vehicle.clone();
-    dbg!(&args.connect);
+    debug!("Connection string: {}", &args.connect);
 
     let config = if let Some(config) = &args.config {
         Config::from_file(&config).unwrap()
@@ -47,10 +51,14 @@ fn main() {
         loop {
             match vehicle.recv() {
                 Ok(msg) => {
-                    tx.send(msg);
+                    debug!("Received MAVLink message from vehicle: {:?}", &msg);
+                    let _ = tx.send(MAVLinkMessage {
+                        header: msg.0,
+                        message: msg.1,
+                    });
                 }
                 Err(error) => {
-                    println!("Error {:#?}", error);
+                    error!("Error {:#?}", error);
                 }
             }
         }
@@ -58,10 +66,11 @@ fn main() {
 
     task_master.spawn("MAVLink Heartbeat Loop".into(), async move {
         while Err(tokio::sync::broadcast::error::TryRecvError::Closed) != rx1.try_recv() {
-            println!("Sending heartbeat..");
-            heartbeat_vehicle
+            debug!("Sending heartbeat..");
+            let result = heartbeat_vehicle
                 .send(&mavlink::MavHeader::default(), &heartbeat_message())
                 .unwrap();
+            debug!("M S2: {result:?}");
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         }
     });
@@ -79,7 +88,7 @@ fn main() {
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
                     break;
                 }
-                Err(error) => { /* dbg!(error); */ }
+                Err(error) => { trace!("{error:?}"); }
             };
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
@@ -88,19 +97,18 @@ fn main() {
     task_master.spawn("Zenoh -> MAVLink".into(), async move {
         while let Ok(sample) = subscriber.recv_async().await {
             if let Ok(msg) = serde_json::Value::try_from(sample.value) {
-                println!("Received: {:?}", &msg);
+                debug!("Received: {:?}", &msg);
 
                 match serde_json::from_value::<MAVLinkMessage<mavlink::ardupilotmega::MavMessage>>(
                     msg.clone(),
                 ) {
                     Ok(content) => {
-                        println!("Send!");
                         let result = sender_vehicle.send(&content.header, &content.message);
-                        dbg!(result);
+                        debug!("Z->M: {result:?}");
                         continue;
                     }
                     Err(error) => {
-                        println!("Failed to parse zenoh to MAVLink: {error:#?}");
+                        error!("Failed to parse zenoh to MAVLink: {error:#?}");
                     }
                 }
 
@@ -110,13 +118,12 @@ fn main() {
                     >(&content)
                     {
                         Ok(content) => {
-                            println!("Parsed zenoh to MAVLink: {content:#?}");
                             let result = sender_vehicle.send(&content.header, &content.message);
-                            dbg!(result);
+                            debug!("Z-M: {result:?}");
                         }
-                        Err(error) => println!("Failed to parse string to MAVLink: {error:#?}"),
+                        Err(error) => error!("Failed to parse string to MAVLink: {error:#?}"),
                     },
-                    Err(error) => println!("Failed to parse zenoh to string: {error:#?}"),
+                    Err(error) => error!("Failed to parse zenoh to string: {error:#?}"),
                 }
             }
         }
